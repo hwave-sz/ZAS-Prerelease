@@ -80,63 +80,88 @@ def build_workload(n, seed=20261127):
 
 # ---------------- HTTP（流式） ----------------
 def one_request(base, spec, model, deadline_s, sink):
-    """发一条流式请求，记录 TTFT / 逐 token 间隔 / e2e。"""
+    """发一条流式请求，按 SSE **行**解析。
+
+    口径修正（2026-11-27 负责人指出，逐条对应）：
+    1. TTFT = 第一个含非空 delta.content 的 SSE 行到达时刻（不是首次 read() 返回时刻；
+       旧实现用 read(4096) 会把多行打包，TTFT 被系统性低估）。
+    2. token 数优先用 usage.completion_tokens（需 stream_options.include_usage）；
+       帧计数只作 fallback 并打标记，因为 SSE 帧 ≠ token。
+    3. TPOT 官方口径 = 每秒输出 token（tok/s）；同时记 ms/token 便于和历史数据对照。
+    4. 成功 = 见到 [DONE] 且 finish_reason ∈ {stop,length} 且 token>0。
+       旧实现只看 ntok>0，会把"半截就断"也算成功（成功率虚高）。
+    """
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": spec["prompt"]}],
         "max_tokens": spec["max_tokens"],
         "temperature": 0,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }).encode()
     req = urllib.request.Request(base + "/v1/chat/completions", data=body,
                                  headers={"Content-Type": "application/json"})
     t0 = time.time()
     rec = {"key": spec["key"], "dup": spec["dup"], "max_tokens": spec["max_tokens"],
            "offered_s": round(t0 - T_ARM0, 3), "ok": False, "first_ms": None,
-           "end_ms": None, "tokens": 0, "tpot_ms": None, "err": None, "inst": None,
-           "ttft_stamps": []}
+           "end_ms": None, "tokens": 0, "tokens_src": None, "tpot_ms": None,
+           "out_tps": None, "finish": None, "done": False, "usage_seen": False,
+           "err": None, "inst": None, "cache": None, "n_frames": 0}
     try:
         with urllib.request.urlopen(req, timeout=deadline_s) as r:
             rec["inst"] = r.headers.get("X-Upstream-Inst")
             rec["cache"] = r.headers.get("X-Cache")
-            buf = b""
-            stamps = []
-            ntok = 0
             t_first = None
-            while True:
-                chunk = r.read(4096)
-                if not chunk:
-                    break
-                if t_first is None:
-                    t_first = time.time() - t0
-                    rec["first_ms"] = round(t_first * 1000, 1)
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line.startswith(b"data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == b"[DONE]":
-                        continue
-                    try:
-                        obj = json.loads(payload)
-                    except Exception:
-                        continue
-                    ch = obj.get("choices") or []
-                    if ch and (ch[0].get("delta") or {}).get("content"):
-                        ntok += 1
-                        stamps.append(time.time() - t0)
+            t_last = None
+            n_frames = 0
+            usage_tok = None
+            for raw in r:  # 行缓冲：每行到达即打点
+                now = time.time() - t0
+                line = raw.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == b"[DONE]":
+                    rec["done"] = True
+                    continue
+                try:
+                    obj = json.loads(payload)
+                except Exception:
+                    continue
+                u = obj.get("usage")
+                if isinstance(u, dict) and u.get("completion_tokens") is not None:
+                    usage_tok = int(u["completion_tokens"])
+                    rec["usage_seen"] = True
+                for ch in (obj.get("choices") or []):
+                    fr = ch.get("finish_reason")
+                    if fr:
+                        rec["finish"] = fr
+                    d = ch.get("delta") or {}
+                    if d.get("content"):
+                        n_frames += 1
+                        if t_first is None:
+                            t_first = now
+                            rec["first_ms"] = round(now * 1000, 1)
+                        t_last = now
             t_end = time.time() - t0
-            rec["tokens"] = ntok
+            rec["n_frames"] = n_frames
             rec["end_ms"] = round(t_end * 1000, 1)
-            if ntok >= 2 and stamps:
-                # TPOT = 首 token 之后每个 token 的平均间隔（ms）
-                span = stamps[-1] - stamps[0]
-                rec["tpot_ms"] = round(span / (ntok - 1) * 1000, 2) if ntok > 1 else None
-            rec["ok"] = ntok > 0
+            # token 数：usage 优先，帧数兜底（并记录来源，便于审计）
+            if usage_tok is not None:
+                rec["tokens"] = usage_tok
+                rec["tokens_src"] = "usage"
+            else:
+                rec["tokens"] = n_frames
+                rec["tokens_src"] = "frames"
+            # 官方 TPOT 口径：每秒输出 token（首 token 之后的解码窗口）
+            tok, tf, tl = rec["tokens"], t_first, t_last
+            if tok and tok > 1 and tf is not None and tl is not None and tl > tf:
+                rec["out_tps"] = round((tok - 1) / (tl - tf), 2)
+                rec["tpot_ms"] = round((tl - tf) / (tok - 1) * 1000, 2)
+            rec["ok"] = bool(rec["done"] and rec["finish"] in ("stop", "length") and tok > 0)
             if not rec["ok"]:
-                rec["err"] = "zero_content"
+                rec["err"] = "incomplete(done=%s,finish=%s,tok=%s)" % (
+                    rec["done"], rec["finish"], tok)
     except urllib.error.HTTPError as e:
         rec["err"] = "http_%d" % e.code
         try:
@@ -195,15 +220,22 @@ def pct(xs, q):
 def summarize(recs, duration_s):
     ok = [r for r in recs if r["ok"]]
     ttft = [r["first_ms"] for r in ok if r["first_ms"]]
-    tpot = [r["tpot_ms"] for r in ok if r["tpot_ms"]]
+    tpot = [r["tpot_ms"] for r in ok if r.get("tpot_ms")]      # ms/token（对照用）
+    tps = [r["out_tps"] for r in ok if r.get("out_tps")]        # 官方口径 tok/s
     e2e = [r["end_ms"] for r in ok if r["end_ms"]]
     toks = sum(r["tokens"] for r in ok)
+    usage_share = sum(1 for r in ok if r.get("usage_seen")) * 100.0 / max(1, len(ok))
     return {
         "n": len(recs), "ok": len(ok), "success": round(len(ok) / max(1, len(recs)) * 100, 2),
         "ttft_p50": pct(ttft, .5), "ttft_p95": pct(ttft, .95), "ttft_p99": pct(ttft, .99),
-        "tpot_p50": pct(tpot, .5), "tpot_p95": pct(tpot, .95), "tpot_p99": pct(tpot, .99),
+        "tpot_p50": pct(tpot, .5), "tpot_p99": pct(tpot, .99),      # ms/token
+        "out_tps_p50": pct(tps, .5), "out_tps_p5": pct(tps, .05),    # 官方 tok/s（越低越差）
         "e2e_p50": pct(e2e, .5), "e2e_p99": pct(e2e, .99),
+        "tokens_total": toks,
         "out_tok_per_s": round(toks / duration_s, 1),
+        "usage_share_pct": round(usage_share, 1),   # 100 ⇒ token 数全是 usage 精确值
+        "tokens_src": {s: sum(1 for r in ok if r.get("tokens_src") == s)
+                       for s in {r.get("tokens_src") for r in ok if r.get("tokens_src")}},
         "errs": {e: sum(1 for r in recs if r["err"] == e) for e in
                  {r["err"] for r in recs if r["err"]}},
     }
