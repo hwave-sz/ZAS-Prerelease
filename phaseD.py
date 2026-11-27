@@ -251,6 +251,17 @@ def patch_yaml(src, dst, strategy, independent, port):
                          txt, count=1, flags=re.M)
     else:
         txt = txt + "\nreuse:\n  independent: %s\n" % ("true" if independent else "false")
+    # KV 遥测：utility_v2 的 ρ 有两条来源（网关账本 + vLLM 实测）。
+    # 账本只看得见"经过网关的"在途；外部负载（绕开网关直打引擎）只有 vLLM /metrics 能看见。
+    # 键名：upstream.live.kv_state_shadow（缺省 false ⇒ 负载维度对引擎真实状态是瞎的）。
+    if os.environ.get("KVSH") == "1":
+        if re.search(r"^\s*kv_state_shadow:", txt, re.M):
+            txt = re.sub(r"^(\s*kv_state_shadow:\s*).*$", r"\1true", txt, count=1, flags=re.M)
+        elif re.search(r"^\s*live:\s*$", txt, re.M):
+            txt = re.sub(r"^(\s*live:\s*)$", r"\1\n    kv_state_shadow: true",
+                         txt, count=1, flags=re.M)
+        else:
+            txt += "\nupstream:\n  live:\n    kv_state_shadow: true\n"
     open(dst, "w", encoding="utf-8").write(txt)
     return dst
 
